@@ -29,6 +29,22 @@ export interface AgentConfig {
   version_uuid: string;
 }
 
+export interface AgentParameters {
+  file_upload?: {
+    enabled?: boolean;
+    number_limits?: number;
+    allowed_file_types?: string[];
+    transfer_methods?: string[];
+  };
+  system_parameters?: {
+    file_size_limit?: number;
+    image_file_size_limit?: number;
+    audio_file_size_limit?: number;
+    video_file_size_limit?: number;
+    file_upload_count_limit?: number;
+  };
+}
+
 export interface Conversation {
   id: string;
   title: string;
@@ -90,6 +106,38 @@ export interface UploadedFile {
   created_at: number;
 }
 
+export interface MessageAttachment {
+  id: string;
+  name: string;
+  size: number;
+  extension: string;
+  mimeType: string;
+  contentStatus?: string;
+}
+
+export interface GeneratedArtifact {
+  key: string;
+  messageId: string;
+  artifactId?: string;
+  invocationId?: string;
+  skillId?: string;
+  toolName?: string;
+  fileId?: string;
+  toolFileId?: string;
+  uploadFileId?: string;
+  filename: string;
+  extension: string;
+  mimeType: string;
+  size?: number;
+  url?: string;
+  downloadUrl?: string;
+  target?: string;
+  lifecycle?: string;
+  availability?: string;
+  expiresAt?: string | number;
+  transferMethod?: string;
+}
+
 export interface MemorySlot {
   id: string;
   key: string;
@@ -140,6 +188,8 @@ export interface UiMessage {
   status?: string;
   model?: string;
   error?: string;
+  attachments?: MessageAttachment[];
+  artifacts?: GeneratedArtifact[];
 }
 
 export type PendingInteraction =

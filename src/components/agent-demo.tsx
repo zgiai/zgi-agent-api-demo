@@ -12,6 +12,7 @@ import {
 } from "react";
 import type {
   AgentConfig,
+  AgentParameters,
   Conversation,
   ConversationList,
   ConversationMessage,
@@ -39,12 +40,28 @@ import {
 import type { AgentApiConnection } from "@/lib/zgi-client";
 import { getAgentEventDefinition, PUBLIC_AGENT_EVENT_NAMES } from "@/lib/agent-event-catalog";
 import { isPendingInteractionDisabled, normalizeApprovalState } from "@/lib/approval-state";
+import {
+  clearStoredConnection,
+  loadOrMigrateConnection,
+  loadStoredBaseUrl,
+  saveConnection,
+} from "@/lib/connection-storage";
+import {
+  artifactExpiryTimestamp,
+  artifactIsUnavailable,
+  attachmentFromUploadedFile,
+  attachmentsFromMetadata,
+  formatFileSize,
+  generatedArtifactsFromMetadata,
+  normalizeGeneratedArtifact,
+  resolveArtifactUrl,
+  upsertGeneratedArtifact,
+} from "@/lib/file-presentation";
+import { MarkdownContent } from "./markdown-content";
 import { MemoryPanel } from "./memory-panel";
 
 const DEFAULT_USER = "demo-user-001";
 const DEFAULT_API_BASE_URL = "http://localhost:2870/api/v1";
-const API_BASE_STORAGE_KEY = "zgi-demo-api-base-url";
-const API_KEY_SESSION_KEY = "zgi-demo-api-key";
 const MAX_RECONNECT_ATTEMPTS = 5;
 
 type ConnectionPhase = "idle" | "connecting" | "streaming" | "reconnecting" | "restoring" | "waiting" | "failed";
@@ -59,6 +76,15 @@ interface StreamOptions {
   source?: Exclude<EventDeliverySource, "reconnect">;
 }
 
+interface PendingUpload {
+  localId: string;
+  file: File;
+  status: "uploading" | "ready" | "error";
+  uploaded?: UploadedFile;
+  error?: string;
+  retryable?: boolean;
+}
+
 export function AgentDemo() {
   const [apiConnection, setApiConnection] = useState<AgentApiConnection | null>(null);
   const [apiBaseDraft, setApiBaseDraft] = useState(DEFAULT_API_BASE_URL);
@@ -67,14 +93,14 @@ export function AgentDemo() {
   const [activeUser, setActiveUser] = useState(DEFAULT_USER);
   const [userDraft, setUserDraft] = useState(DEFAULT_USER);
   const [config, setConfig] = useState<AgentConfig | null>(null);
+  const [parameters, setParameters] = useState<AgentParameters | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [search, setSearch] = useState("");
   const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [query, setQuery] = useState("");
-  const [uploads, setUploads] = useState<UploadedFile[]>([]);
-  const [uploading, setUploading] = useState(false);
+  const [uploadItems, setUploadItems] = useState<PendingUpload[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [continuing, setContinuing] = useState(false);
   const [progress, setProgress] = useState("");
@@ -97,24 +123,36 @@ export function AgentDemo() {
     () => conversations.find((item) => item.id === currentConversationId) ?? null,
     [conversations, currentConversationId],
   );
+  const uploadedFiles = uploadItems.flatMap((item) => item.uploaded ? [item.uploaded] : []);
+  const uploading = uploadItems.some((item) => item.status === "uploading");
+  const allowedFileTypes = parameters?.file_upload?.allowed_file_types || [];
+  const uploadLimit = parameters?.file_upload?.number_limits
+    || parameters?.system_parameters?.file_upload_count_limit
+    || 0;
   const restoreConversation = useEffectEvent((id: string) => {
     void openConversation(id);
   });
 
   useEffect(() => {
     const storedUser = window.localStorage.getItem("zgi-demo-user");
-    const storedBaseUrl = window.localStorage.getItem(API_BASE_STORAGE_KEY) || DEFAULT_API_BASE_URL;
-    const sessionApiKey = window.sessionStorage.getItem(API_KEY_SESSION_KEY) || "";
+    const storedConnection = loadOrMigrateConnection(
+      window.localStorage,
+      window.sessionStorage,
+      DEFAULT_API_BASE_URL,
+    );
+    const storedBaseUrl = storedConnection?.baseUrl
+      || loadStoredBaseUrl(window.localStorage, DEFAULT_API_BASE_URL);
+    const storedApiKey = storedConnection?.apiKey || "";
     const timer = window.setTimeout(() => {
       if (storedUser && storedUser !== DEFAULT_USER) {
         setActiveUser(storedUser);
         setUserDraft(storedUser);
       }
       setApiBaseDraft(storedBaseUrl);
-      setApiKeyDraft(sessionApiKey);
-      if (sessionApiKey) {
+      setApiKeyDraft(storedApiKey);
+      if (storedApiKey) {
         try {
-          setApiConnection({ baseUrl: normalizeAgentApiBaseUrl(storedBaseUrl), apiKey: sessionApiKey });
+          setApiConnection({ baseUrl: normalizeAgentApiBaseUrl(storedBaseUrl), apiKey: storedApiKey });
           setShowConnectionSetup(false);
         } catch {
           setShowConnectionSetup(true);
@@ -162,12 +200,14 @@ export function AgentDemo() {
     async function bootstrap() {
       setFatalError(null);
       try {
-        const [nextConfig, list] = await Promise.all([
+        const [nextConfig, nextParameters, list] = await Promise.all([
           zgiJson<AgentConfig>(currentApiConnection, "agents/config", activeUser),
+          zgiJson<AgentParameters>(currentApiConnection, "parameters", activeUser),
           zgiJson<ConversationList>(currentApiConnection, "agents/conversations?page=1&limit=50", activeUser),
         ]);
         if (cancelled) return;
         setConfig(nextConfig);
+        setParameters(nextParameters);
         setConversations(list.data);
         const storedConversationId = window.localStorage.getItem(conversationKey(activeUser));
         if (storedConversationId && list.data.some((item) => item.id === storedConversationId)) {
@@ -190,11 +230,12 @@ export function AgentDemo() {
   function resetWorkspaceState() {
     streamController.current?.abort();
     setConfig(null);
+    setParameters(null);
     setConversations([]);
     setSearchResults([]);
     setCurrentConversationId(null);
     setMessages([]);
-    setUploads([]);
+    setUploadItems([]);
     setPending(null);
     setEventLog([]);
     setProgress("");
@@ -208,26 +249,26 @@ export function AgentDemo() {
       const baseUrl = normalizeAgentApiBaseUrl(apiBaseDraft);
       const apiKey = apiKeyDraft.trim();
       if (!apiKey) throw new AgentApiError("API Key 不能为空", 0);
-      window.localStorage.setItem(API_BASE_STORAGE_KEY, baseUrl);
-      window.sessionStorage.setItem(API_KEY_SESSION_KEY, apiKey);
+      const connection = { baseUrl, apiKey };
+      const saved = saveConnection(window.localStorage, connection, window.sessionStorage);
       resetWorkspaceState();
       setApiBaseDraft(baseUrl);
-      setApiConnection({ baseUrl, apiKey });
+      setApiConnection(connection);
       setShowConnectionSetup(false);
       setConnection({ phase: "connecting", attempt: 0 });
-      setNotice("连接配置已应用");
+      setNotice(saved ? "连接配置已保存到本机浏览器" : "连接已应用，但浏览器拒绝了本地保存");
     } catch (error) {
       setFatalError(errorMessage(error));
     }
   }
 
   function clearApiSettings() {
-    window.sessionStorage.removeItem(API_KEY_SESSION_KEY);
+    clearStoredConnection(window.localStorage, window.sessionStorage);
     resetWorkspaceState();
     setApiKeyDraft("");
     setApiConnection(null);
     setShowConnectionSetup(true);
-    setNotice("当前标签页的 API Key 已清除");
+    setNotice("本机保存的连接配置已清除");
   }
 
   function applyUser() {
@@ -245,6 +286,7 @@ export function AgentDemo() {
     setActiveUser(normalized);
     setCurrentConversationId(null);
     setMessages([]);
+    setUploadItems([]);
     setPending(null);
     setEventLog([]);
     setProgress("");
@@ -257,6 +299,7 @@ export function AgentDemo() {
     setFatalError(null);
     setPending(null);
     setEventLog([]);
+    setUploadItems([]);
     setProgress("");
     setConnection({ phase: "idle", attempt: 0 });
     setCurrentConversationId(id);
@@ -309,6 +352,7 @@ export function AgentDemo() {
     if (streaming) return;
     setCurrentConversationId(null);
     setMessages([]);
+    setUploadItems([]);
     setPending(null);
     setEventLog([]);
     setProgress("");
@@ -495,6 +539,18 @@ export function AgentDemo() {
           return;
         }
 
+        if (event.event === "skill_artifact_created") {
+          const artifact = normalizeGeneratedArtifact(event.data, messageId);
+          if (artifact) {
+            updateAssistant(messageId, (message) => ({
+              ...message,
+              artifacts: upsertGeneratedArtifact(message.artifacts || [], artifact),
+            }));
+          }
+          setProgress(eventProgressLabel(event.event, event.data));
+          return;
+        }
+
         const optionalProgress = eventProgressLabel(event.event, event.data);
         if (optionalProgress) setProgress(optionalProgress);
       }, {
@@ -544,18 +600,23 @@ export function AgentDemo() {
     event?.preventDefault();
     const text = (override ?? query).trim();
     if (!text || streaming) return;
+    if (uploading) {
+      setNotice("请等待文件上传完成后再发送");
+      return;
+    }
 
     const optimisticMessageId = `pending-${crypto.randomUUID()}`;
+    const messageAttachments = uploadedFiles.map(attachmentFromUploadedFile);
     setMessages((current) => [
       ...current,
-      { id: `${optimisticMessageId}-user`, role: "user", content: text },
+      { id: `${optimisticMessageId}-user`, role: "user", content: text, attachments: messageAttachments },
       { id: optimisticMessageId, role: "assistant", content: "", status: "running" },
     ]);
     setQuery("");
     setPending(null);
     const body: JsonObject = { query: text, response_mode: "streaming" };
     if (currentConversationId) body.conversation_id = currentConversationId;
-    if (uploads.length) body.file_ids = uploads.map((file) => file.id);
+    if (uploadedFiles.length) body.file_ids = uploadedFiles.map((file) => file.id);
 
     const controller = new AbortController();
     streamController.current = controller;
@@ -565,7 +626,7 @@ export function AgentDemo() {
         body: JSON.stringify(body),
         signal: controller.signal,
       });
-      setUploads([]);
+      setUploadItems([]);
       await runEventStream(response, { optimisticMessageId, reconnect: true, source: "chat" });
     } catch (error) {
       setStreaming(false);
@@ -640,20 +701,49 @@ export function AgentDemo() {
 
   async function uploadFiles(files: FileList | null) {
     if (!files?.length) return;
-    setUploading(true);
-    setFatalError(null);
+    const occupied = uploadItems.filter((item) => item.status !== "error").length;
+    let acceptedCount = occupied;
+    const items = Array.from(files).map((file): PendingUpload => {
+      const validationError = uploadValidationError(
+        file,
+        acceptedCount,
+        uploadLimit,
+        allowedFileTypes,
+        parameters,
+      );
+      if (!validationError) acceptedCount += 1;
+      return {
+        localId: crypto.randomUUID(),
+        file,
+        status: validationError ? "error" : "uploading",
+        error: validationError || undefined,
+        retryable: !validationError,
+      };
+    });
+    setUploadItems((current) => [...current, ...items]);
+    await Promise.all(items.filter((item) => item.status === "uploading").map((item) => uploadFileItem(item.localId, item.file)));
+  }
+
+  async function uploadFileItem(localId: string, file: File) {
+    setUploadItems((current) => current.map((item) =>
+      item.localId === localId ? { ...item, status: "uploading", error: undefined } : item,
+    ));
     try {
-      const next: UploadedFile[] = [];
-      for (const file of Array.from(files)) {
-        const form = new FormData();
-        form.append("file", file);
-        next.push(await zgiJson<UploadedFile>(requireApiConnection(), "files/upload", activeUser, { method: "POST", body: form }));
-      }
-      setUploads((current) => [...current, ...next]);
+      const form = new FormData();
+      form.append("file", file);
+      const uploaded = await zgiJson<UploadedFile>(
+        requireApiConnection(),
+        "files/upload",
+        activeUser,
+        { method: "POST", body: form },
+      );
+      setUploadItems((current) => current.map((item) =>
+        item.localId === localId ? { ...item, status: "ready", uploaded, error: undefined } : item,
+      ));
     } catch (error) {
-      setFatalError(errorMessage(error));
-    } finally {
-      setUploading(false);
+      setUploadItems((current) => current.map((item) =>
+        item.localId === localId ? { ...item, status: "error", error: errorMessage(error), retryable: true } : item,
+      ));
     }
   }
 
@@ -839,7 +929,13 @@ export function AgentDemo() {
               <Welcome config={config} title={title} configured={!!apiConnection} onPrompt={(prompt) => void sendMessage(undefined, prompt)} />
             ) : (
               <div className="messages">
-                {messages.map((message) => <MessageBubble key={`${message.role}-${message.id}`} message={message} />)}
+                {messages.map((message) => (
+                  <MessageBubble
+                    key={`${message.role}-${message.id}`}
+                    message={message}
+                    apiBaseUrl={apiConnection?.baseUrl || ""}
+                  />
+                ))}
                 {progress && <div className="progress-line"><span className="thinking-dots"><i /><i /><i /></span>{progress}</div>}
                 {pending && (
                   <InteractionCard
@@ -858,17 +954,44 @@ export function AgentDemo() {
           {showEvents && <EventDrawer events={eventLog} onClose={() => setShowEvents(false)} />}
 
           <div className="composer-wrap">
-            {!!uploads.length && (
-              <div className="upload-chips">
-                {uploads.map((file) => (
-                  <span key={file.id}>⌑ {file.name}<button onClick={() => setUploads((current) => current.filter((item) => item.id !== file.id))}>×</button></span>
+            {!!uploadItems.length && (
+              <div className="upload-queue" aria-live="polite">
+                {uploadItems.map((item) => (
+                  <div className={`upload-card is-${item.status}`} key={item.localId}>
+                    <span className="file-extension">{displayExtension(item.file.name, item.file.type)}</span>
+                    <span className="upload-copy">
+                      <strong title={item.file.name}>{item.file.name}</strong>
+                      <small>
+                        {formatFileSize(item.file.size)} · {item.status === "uploading"
+                          ? "上传中…"
+                          : item.status === "ready"
+                            ? "已上传，发送时会附加"
+                            : item.error || "上传失败"}
+                      </small>
+                    </span>
+                    {item.status === "error" && item.retryable && (
+                      <button type="button" className="upload-retry" onClick={() => void uploadFileItem(item.localId, item.file)}>重试</button>
+                    )}
+                    <button
+                      type="button"
+                      className="upload-remove"
+                      aria-label={`移除 ${item.file.name}`}
+                      onClick={() => setUploadItems((current) => current.filter((entry) => entry.localId !== item.localId))}
+                    >×</button>
+                  </div>
                 ))}
               </div>
             )}
             <form className="composer" onSubmit={(event) => void sendMessage(event)}>
               {config?.file_upload_enabled && (
                 <label className={`attach-button ${uploading ? "is-loading" : ""}`} title="上传附件">
-                  <input type="file" multiple onChange={(event) => { void uploadFiles(event.target.files); event.target.value = ""; }} disabled={uploading || streaming} />
+                  <input
+                    type="file"
+                    multiple
+                    accept={allowedFileTypes.length ? allowedFileTypes.map((type) => `.${type.replace(/^\./, "")}`).join(",") : undefined}
+                    onChange={(event) => { void uploadFiles(event.target.files); event.target.value = ""; }}
+                    disabled={streaming || !apiConnection}
+                  />
                   {uploading ? "…" : "＋"}
                 </label>
               )}
@@ -883,11 +1006,15 @@ export function AgentDemo() {
               {streaming ? (
                 <button type="button" className="stop-button" onClick={() => void stopStream()} title="停止生成"><span /></button>
               ) : (
-                <button type="submit" className="send-button" disabled={!query.trim() || !apiConnection} title="发送">↑</button>
+                <button type="submit" className="send-button" disabled={!query.trim() || !apiConnection || uploading} title={uploading ? "等待文件上传完成" : "发送"}>↑</button>
               )}
             </form>
             <div className="composer-footer">
-              <span>API Key 仅由当前标签页提交给同源 demo 代理</span>
+              <span>{uploading
+                ? "文件上传完成后即可发送"
+                : uploadItems.length
+                  ? `${uploadedFiles.length}${uploadLimit ? ` / ${uploadLimit}` : ""} 个文件已就绪`
+                  : "Base URL 与 API Key 已保存在本机浏览器"}</span>
               {!!messages.length && !streaming && <button onClick={() => void regenerate()}>↻ 重新生成上一条</button>}
             </div>
           </div>
@@ -946,16 +1073,88 @@ function Welcome({ config, title, configured, onPrompt }: { config: AgentConfig 
   );
 }
 
-function MessageBubble({ message }: { message: UiMessage }) {
+function MessageBubble({ message, apiBaseUrl }: { message: UiMessage; apiBaseUrl: string }) {
   return (
     <article className={`message ${message.role}`}>
       <div className="message-avatar">{message.role === "user" ? "你" : "Z"}</div>
       <div className="message-body">
         <div className="message-label"><strong>{message.role === "user" ? "你" : "Agent"}</strong>{message.model && <span>{message.model}</span>}{message.status && <span>{statusLabel(message.status)}</span>}</div>
-        <div className="message-content">{message.content || (message.status === "running" ? <span className="thinking-dots"><i /><i /><i /></span> : "（无文本输出）")}</div>
+        <div className="message-content">
+          {message.content
+            ? message.role === "assistant"
+              ? <MarkdownContent content={message.content} />
+              : message.content
+            : message.status === "running"
+              ? <span className="thinking-dots"><i /><i /><i /></span>
+              : "（无文本输出）"}
+        </div>
+        {!!message.attachments?.length && (
+          <div className="message-attachments" aria-label="本轮上传文件">
+            {message.attachments.map((file) => (
+              <span key={file.id} title={file.name}>
+                <b>{displayExtension(file.name, file.mimeType)}</b>
+                <span><strong>{file.name}</strong><small>{formatFileSize(file.size)}{file.contentStatus ? ` · ${attachmentStatusLabel(file.contentStatus)}` : ""}</small></span>
+              </span>
+            ))}
+          </div>
+        )}
+        {!!message.artifacts?.length && (
+          <div className="artifact-grid" aria-label="Agent 生成文件">
+            {message.artifacts.map((artifact) => (
+              <GeneratedFileCard key={artifact.key} artifact={artifact} apiBaseUrl={apiBaseUrl} />
+            ))}
+          </div>
+        )}
         {message.error && <p className="message-error">{message.error}</p>}
       </div>
     </article>
+  );
+}
+
+function GeneratedFileCard({ artifact, apiBaseUrl }: {
+  artifact: NonNullable<UiMessage["artifacts"]>[number];
+  apiBaseUrl: string;
+}) {
+  const [clock, setClock] = useState(() => Date.now());
+  const expiry = artifactExpiryTimestamp(artifact.expiresAt);
+  const unavailable = artifactIsUnavailable(artifact, clock);
+  const previewUrl = resolveArtifactUrl(artifact.url, apiBaseUrl);
+  const downloadUrl = resolveArtifactUrl(artifact.downloadUrl || artifact.url, apiBaseUrl);
+
+  useEffect(() => {
+    if (expiry === null || unavailable) return;
+    const refresh = () => {
+      if (expiry <= Date.now()) {
+        setClock(Date.now());
+        return;
+      }
+      timer = window.setTimeout(refresh, Math.min(expiry - Date.now() + 50, 2_147_483_647));
+    };
+    let timer = window.setTimeout(refresh, Math.min(Math.max(0, expiry - Date.now() + 50), 2_147_483_647));
+    return () => window.clearTimeout(timer);
+  }, [expiry, unavailable]);
+
+  const lifecycle = unavailable
+    ? "文件已失效"
+    : artifact.target === "managed_file" || ["managed", "persistent"].includes(artifact.lifecycle || "")
+      ? "持久文件"
+      : artifact.expiresAt !== undefined
+        ? `临时文件 · ${formatArtifactExpiry(artifact.expiresAt)}`
+        : "生成文件";
+
+  return (
+    <section className={`artifact-card ${unavailable ? "is-unavailable" : ""}`}>
+      <span className="artifact-icon">{displayExtension(artifact.filename, artifact.mimeType)}</span>
+      <span className="artifact-copy">
+        <strong title={artifact.filename}>{artifact.filename}</strong>
+        <small>{formatFileSize(artifact.size)} · {lifecycle}</small>
+        {(artifact.skillId || artifact.toolName) && <em>{[artifact.skillId, artifact.toolName].filter(Boolean).join(" / ")}</em>}
+      </span>
+      <span className="artifact-actions">
+        {!unavailable && previewUrl && previewUrl !== downloadUrl && <a href={previewUrl} target="_blank" rel="noreferrer">预览</a>}
+        {!unavailable && downloadUrl ? <a href={downloadUrl} target="_blank" rel="noreferrer">下载</a> : <span>{unavailable ? "已失效" : "暂无链接"}</span>}
+      </span>
+    </section>
   );
 }
 
@@ -1203,7 +1402,7 @@ function ConnectionSetup({
           <div><span className="eyebrow">Browser configuration</span><h2 id="connection-title">连接 Agent API</h2></div>
           {configured && <button className="dialog-close" onClick={onClose} aria-label="关闭连接设置">×</button>}
         </header>
-        <p>Base URL 和 API Key 在页面中配置，请求先进入同源 Next.js 代理，再由代理访问 ZGI；无需修改 ZGI 的 CORS。</p>
+        <p>Base URL 和 API Key 会持久保存在当前浏览器，请求先进入同源 Next.js 代理，再由代理访问 ZGI；无需修改 ZGI 的 CORS。</p>
         <form onSubmit={onApply}>
           <label>
             <span>Agent API Base URL</span>
@@ -1228,14 +1427,14 @@ function ConnectionSetup({
               spellCheck={false}
               required
             />
-            <small>不会写入仓库或 localStorage；只提交给当前 demo 的同源代理。</small>
+            <small>保存在当前浏览器的 localStorage，关闭或重启浏览器后仍可复用，不会写入仓库。</small>
           </label>
           <div className="connection-warning">
             <strong>仅用于本地接入演示</strong>
-            <span>浏览器和开发者工具仍可访问页面中填写的 Key。生产环境请由服务端安全配置 Key，不要让最终用户输入或持有它。</span>
+            <span>localStorage、浏览器扩展和开发者工具均可读取该 Key。仅在可信本机使用；生产环境请由服务端安全配置 Key，不要让最终用户输入或持有它。</span>
           </div>
           <footer>
-            {configured && <button type="button" className="clear-connection" onClick={onClear}>清除当前 Key</button>}
+            {configured && <button type="button" className="clear-connection" onClick={onClear}>清除本地连接</button>}
             <button type="submit" className="primary-button">保存并连接</button>
           </footer>
         </form>
@@ -1594,9 +1793,88 @@ function upsertConversation(items: Conversation[], detail: Conversation): Conver
 
 function toUiMessages(message: ConversationMessage): UiMessage[] {
   const result: UiMessage[] = [];
-  if (message.query) result.push({ id: `${message.id}-user`, role: "user", content: message.query });
-  result.push({ id: message.id, role: "assistant", content: message.answer, status: message.status, model: message.model_name, error: message.error || undefined });
+  const attachments = attachmentsFromMetadata(message.metadata);
+  const artifacts = generatedArtifactsFromMetadata(message.metadata, message.id);
+  if (message.query) {
+    result.push({
+      id: `${message.id}-user`,
+      role: "user",
+      content: message.query,
+      attachments: attachments.length ? attachments : undefined,
+    });
+  }
+  result.push({
+    id: message.id,
+    role: "assistant",
+    content: message.answer,
+    status: message.status,
+    model: message.model_name,
+    error: message.error || undefined,
+    artifacts: artifacts.length ? artifacts : undefined,
+  });
   return result;
+}
+
+function displayExtension(filename: string, mimeType: string): string {
+  const dot = filename.lastIndexOf(".");
+  const extension = dot > -1 ? filename.slice(dot + 1) : "";
+  if (extension) return extension.slice(0, 5).toUpperCase();
+  if (mimeType.startsWith("image/")) return "IMG";
+  if (mimeType.includes("pdf")) return "PDF";
+  return "FILE";
+}
+
+function uploadValidationError(
+  file: File,
+  occupiedIndex: number,
+  countLimit: number,
+  allowedTypes: string[],
+  parameters: AgentParameters | null,
+): string {
+  if (countLimit > 0 && occupiedIndex >= countLimit) {
+    return `每轮最多上传 ${countLimit} 个文件`;
+  }
+
+  const extension = file.name.includes(".") ? file.name.split(".").pop()?.toLowerCase() || "" : "";
+  const normalizedTypes = allowedTypes.map((type) => type.replace(/^\./, "").toLowerCase());
+  if (normalizedTypes.length && (!extension || !normalizedTypes.includes(extension))) {
+    return extension ? `不支持 .${extension} 文件` : "文件缺少受支持的扩展名";
+  }
+
+  const limits = parameters?.system_parameters;
+  const sizeLimitMb = file.type.startsWith("image/")
+    ? limits?.image_file_size_limit
+    : file.type.startsWith("audio/")
+      ? limits?.audio_file_size_limit
+      : file.type.startsWith("video/")
+        ? limits?.video_file_size_limit
+        : limits?.file_size_limit;
+  if (sizeLimitMb && sizeLimitMb > 0 && file.size > sizeLimitMb * 1024 * 1024) {
+    return `文件不能超过 ${sizeLimitMb} MB`;
+  }
+  return "";
+}
+
+function attachmentStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    pending: "待解析",
+    extracted: "已解析",
+    empty: "无文本内容",
+    vision_ready: "图像已就绪",
+    filtered: "未发送给模型",
+  };
+  return labels[status] || status;
+}
+
+function formatArtifactExpiry(value: string | number): string {
+  const timestamp = artifactExpiryTimestamp(value);
+  if (timestamp === null) return "有效期未知";
+  return `有效期至 ${new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(timestamp)}`;
 }
 
 function compareMessagesChronologically(left: ConversationMessage, right: ConversationMessage): number {

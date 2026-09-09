@@ -14,6 +14,7 @@ const ALLOWED_PATHS = [
   /^agents\/memory(?:\/export)?$/,
   /^agents\/memory\/operations\/[^/]+\/undo$/,
   /^agents\/memory\/[^/]+$/,
+  /^parameters$/,
   /^files\/upload$/,
 ];
 
