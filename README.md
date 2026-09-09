@@ -1,6 +1,6 @@
 # ZGI Agent API · Next.js 接入 Demo
 
-一个可直接运行的 ZGI 落地页级前端示例。它使用 Next.js App Router 和 TypeScript，覆盖公开 Agent API 的主要接入链路。为方便本地验证，Base URL 和 API Key 直接在页面中填写，浏览器会直连 ZGI。
+一个可直接运行的 ZGI 落地页级前端示例。它使用 Next.js App Router 和 TypeScript，覆盖公开 Agent API 的主要接入链路。为方便本地验证，Base URL 和 API Key 直接在页面中填写，请求通过 demo 的同源 Next.js 代理访问 ZGI。
 
 ## 已覆盖能力
 
@@ -27,13 +27,13 @@ pnpm dev
 
 Base URL 保存在 localStorage；API Key 只保存在当前标签页的 sessionStorage，刷新页面仍可使用，关闭标签页后清除。切换 Base URL 或 Key 时，demo 会终止现有事件流并重新加载 Agent 配置和会话。
 
-## 浏览器直连与安全边界
+## 同源代理与安全边界
 
-这个仓库有意采用浏览器直连，以便只修改页面配置就能验证不同环境和 Agent。每个请求都由前端添加 `Authorization: Bearer <API Key>` 和 `X-External-User-ID`。因此 ZGI 网关必须允许 demo 页面来源的 CORS，并允许 `Authorization`、`X-External-User-ID`、`Content-Type` 请求头。
+页面把 Base URL、API Key 和 demo 用户标识提交给同源 `/api/zgi/*` Route Handler。代理只允许本项目使用的 Agent API 路径，把用户标识转换为 `X-External-User-ID`，并透明转发 JSON、文件和 SSE 响应。浏览器不再跨域请求 ZGI，因此不需要在 ZGI 配置 demo 来源的 CORS。
 
-本地 Docker 环境可把 demo 的精确来源加入 `WEB_API_CORS_ALLOW_ORIGINS`，例如 `http://localhost:3000`，然后重建或重启 API 容器。若 Next.js 自动使用了其他端口，也必须加入那个实际来源；不要在生产环境使用宽泛的通配来源。
+Base URL 由页面传给代理，适合本地切换测试环境；不要把这个动态目标代理原样公开部署到互联网。正式接入应在自己的服务端固定允许的 ZGI 地址。
 
-这种结构不适合生产环境：页面 JavaScript、浏览器扩展和开发者工具都可能访问 API Key。正式接入应把 Key 放在自己的服务端代理中，由已认证会话推导稳定、不可识别个人身份的外部用户标识，并在代理层校验 Agent 权限、限流和请求大小。不要信任浏览器提交的用户 id，也不要使用邮箱或手机号。
+本 demo 的浏览器、扩展和开发者工具仍可访问页面中填写的 Key，因此它只适合本地验证。生产环境应由服务端安全配置 Key，并从已认证会话推导稳定、不可识别个人身份的外部用户标识；不要让最终用户输入 Key，也不要信任浏览器提交的用户 id，或使用邮箱、手机号作为用户标识。
 
 ## 代码导航
 
@@ -43,6 +43,7 @@ Base URL 保存在 localStorage；API Key 只保存在当前标签页的 session
 - [`src/lib/zgi-client.ts`](src/lib/zgi-client.ts)：JSON 请求封装和增量 SSE 解析器
 - [`src/lib/agent-event-catalog.ts`](src/lib/agent-event-catalog.ts)：公开事件目录、中文解释和客户端处理建议
 - [`src/lib/agent-api-types.ts`](src/lib/agent-api-types.ts)：公开响应与事件的前端类型
+- [`src/app/api/zgi/[...path]/route.ts`](src/app/api/zgi/%5B...path%5D/route.ts)：读取页面连接配置并同源转发 Agent API
 
 ## SSE 接入要点
 
@@ -75,4 +76,4 @@ pnpm lint
 pnpm build
 ```
 
-此项目是浏览器直连接入参考，不包含登录系统、持久化业务用户映射、生产级密钥保护、限流、审计或监控；上线前应在你自己的服务端代理层补齐这些能力。
+此项目是本地接入参考，不包含登录系统、持久化业务用户映射、生产级密钥保护、限流、审计或监控；上线前应在你自己的服务端代理层补齐这些能力。

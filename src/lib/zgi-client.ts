@@ -1,6 +1,7 @@
 import type { ApiEnvelope, JsonObject, SseEvent } from "./agent-api-types";
 
-const EXTERNAL_USER_HEADER = "X-External-User-ID";
+const DEMO_API_BASE_HEADER = "X-Demo-Agent-API-Base-URL";
+const DEMO_USER_HEADER = "X-Demo-External-User-ID";
 
 export interface AgentApiConnection {
   baseUrl: string;
@@ -31,13 +32,14 @@ export async function zgiFetch(
 ): Promise<Response> {
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${connection.apiKey}`);
-  headers.set(EXTERNAL_USER_HEADER, externalUserId);
+  headers.set(DEMO_API_BASE_HEADER, normalizeAgentApiBaseUrl(connection.baseUrl));
+  headers.set(DEMO_USER_HEADER, externalUserId);
   if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
 
   try {
-    return await fetch(`${normalizeAgentApiBaseUrl(connection.baseUrl)}/${path.replace(/^\/+/, "")}`, {
+    return await fetch(`/api/zgi/${path.replace(/^\/+/, "")}`, {
       ...init,
       headers,
       cache: "no-store",
@@ -45,7 +47,7 @@ export async function zgiFetch(
   } catch (error) {
     if (error instanceof TypeError) {
       throw new AgentApiError(
-        "浏览器无法连接 Agent API。请检查 Base URL、网关状态，以及 CORS 是否允许当前页面来源和 Authorization、X-External-User-ID、Content-Type 请求头。",
+        "浏览器无法连接 demo 的同源 API 代理。请确认 Next.js 开发服务仍在运行。",
         0,
       );
     }

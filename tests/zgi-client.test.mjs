@@ -18,7 +18,7 @@ test("normalizes browser-configured Agent API base URLs", () => {
   assert.throws(() => normalizeAgentApiBaseUrl("https://example.com/api/v1?key=secret"), AgentApiError);
 });
 
-test("sends browser connection credentials and external user directly upstream", async () => {
+test("sends browser connection credentials and external user to the same-origin proxy", async () => {
   const originalFetch = globalThis.fetch;
   let captured;
   globalThis.fetch = async (input, init) => {
@@ -35,10 +35,11 @@ test("sends browser connection credentials and external user directly upstream",
       "demo-user",
     );
     assert.deepEqual(result, { name: "Agent" });
-    assert.equal(captured.input, "http://localhost:2870/api/v1/agents/config");
+    assert.equal(captured.input, "/api/zgi/agents/config");
     const headers = new Headers(captured.init.headers);
     assert.equal(headers.get("Authorization"), "Bearer zgi_test_key");
-    assert.equal(headers.get("X-External-User-ID"), "demo-user");
+    assert.equal(headers.get("X-Demo-Agent-API-Base-URL"), "http://localhost:2870/api/v1");
+    assert.equal(headers.get("X-Demo-External-User-ID"), "demo-user");
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -887,7 +887,7 @@ export function AgentDemo() {
               )}
             </form>
             <div className="composer-footer">
-              <span>本地演示：API Key 在当前标签页中直接使用</span>
+              <span>API Key 仅由当前标签页提交给同源 demo 代理</span>
               {!!messages.length && !streaming && <button onClick={() => void regenerate()}>↻ 重新生成上一条</button>}
             </div>
           </div>
@@ -1203,7 +1203,7 @@ function ConnectionSetup({
           <div><span className="eyebrow">Browser configuration</span><h2 id="connection-title">连接 Agent API</h2></div>
           {configured && <button className="dialog-close" onClick={onClose} aria-label="关闭连接设置">×</button>}
         </header>
-        <p>这个接入 demo 由浏览器直接请求 ZGI。Base URL 会保存在本机，API Key 只保存在当前标签页的 sessionStorage。</p>
+        <p>Base URL 和 API Key 在页面中配置，请求先进入同源 Next.js 代理，再由代理访问 ZGI；无需修改 ZGI 的 CORS。</p>
         <form onSubmit={onApply}>
           <label>
             <span>Agent API Base URL</span>
@@ -1228,11 +1228,11 @@ function ConnectionSetup({
               spellCheck={false}
               required
             />
-            <small>不会写入仓库或 localStorage；请求时作为 Bearer Token 直接发送。</small>
+            <small>不会写入仓库或 localStorage；只提交给当前 demo 的同源代理。</small>
           </label>
           <div className="connection-warning">
             <strong>仅用于本地接入演示</strong>
-            <span>浏览器代码和开发者工具可以访问 API Key。生产环境请改用你自己的服务端代理，并确保 ZGI 的 CORS 允许当前页面来源和所需请求头。</span>
+            <span>浏览器和开发者工具仍可访问页面中填写的 Key。生产环境请由服务端安全配置 Key，不要让最终用户输入或持有它。</span>
           </div>
           <footer>
             {configured && <button type="button" className="clear-connection" onClick={onClear}>清除当前 Key</button>}
