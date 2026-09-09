@@ -1,7 +1,7 @@
 export type JsonObject = Record<string, unknown>;
 
 export interface ApiEnvelope<T> {
-  code: string;
+  code: string | number;
   message: string;
   data: T;
 }
@@ -118,6 +118,13 @@ export interface SseEvent {
   id?: string;
   event: string;
   data: JsonObject;
+}
+
+export type EventDeliverySource = "chat" | "regenerate" | "continuation" | "replay" | "reconnect";
+
+export interface EventLogEntry extends SseEvent {
+  receivedAt: number;
+  source: EventDeliverySource;
 }
 
 export interface UserInputQuestion {

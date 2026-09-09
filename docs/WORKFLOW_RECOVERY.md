@@ -1,6 +1,6 @@
 # Agent 工作流恢复与 UI 接入
 
-本文描述客户端在正常流式回答、网络断线、页面刷新、审批等待、工作流问答和 Skill 补充输入等状态下应该怎样恢复。示例以本项目的同源 `/api/zgi` 代理为基础。
+本文描述客户端在正常流式回答、网络断线、页面刷新、审批等待、工作流问答和 Skill 补充输入等状态下应该怎样恢复。示例中的 `agentApiBaseUrl` 是页面配置的 Agent API Base URL，请求由浏览器直连 ZGI。
 
 ## 三个必须持久化的标识
 
@@ -45,7 +45,13 @@ async function reconnect(conversationId: string, messageId: string) {
   const query = new URLSearchParams({ message_id: messageId });
   if (lastEventId) query.set("after_id", lastEventId);
   const response = await fetch(
-    `/api/zgi/agents/conversations/${conversationId}/events?${query}`,
+    `${agentApiBaseUrl}/agents/conversations/${conversationId}/events?${query}`,
+    {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "X-External-User-ID": externalUserId,
+      },
+    },
   );
   await consumeSse(response, onEvent);
 }
@@ -107,10 +113,14 @@ type ApprovalRequestedData = {
 
 ```ts
 await fetch(
-  `/api/zgi/agents/conversations/${conversationId}/messages/${messageId}/workflow-continuation`,
+  `${agentApiBaseUrl}/agents/conversations/${conversationId}/messages/${messageId}/workflow-continuation`,
   {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "X-External-User-ID": externalUserId,
+      "Content-Type": "application/json",
+    },
     body: JSON.stringify({
       type: "approval",
       approval_token: approval.token, // 规范化后的顶层 approval_token

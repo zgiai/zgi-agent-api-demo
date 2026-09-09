@@ -1,6 +1,6 @@
 # ZGI Agent API · Next.js 接入 Demo
 
-一个可直接运行的 ZGI 落地页级前端示例。它使用 Next.js App Router 和 TypeScript，覆盖公开 Agent API 的主要接入链路，并把 API Key 安全地留在服务端。
+一个可直接运行的 ZGI 落地页级前端示例。它使用 Next.js App Router 和 TypeScript，覆盖公开 Agent API 的主要接入链路。为方便本地验证，Base URL 和 API Key 直接在页面中填写，浏览器会直连 ZGI。
 
 ## 已覆盖能力
 
@@ -12,42 +12,28 @@
 - 停止生成、重新生成上一条回答、上传文件并在下一轮消息中引用文件 id
 - 回答 `user_input_requested`，处理工作流问题和审批后继续同一条消息
 - 查看、编辑、清除、导出和撤销 Agent Memory；写操作使用 revision 做并发保护
-- 内置开发者事件抽屉，便于检查最近的事件名称、游标和 JSON 数据结构
+- 内置开发者事件检查器，覆盖 OpenAPI 声明的全部公开事件，展示事件类别、作用、客户端处理建议、接收来源、恢复游标、关联标识和完整 JSON
 
 ## 启动
 
-前提：本地 ZGI 网关已经运行，并且你已经为一个已发布 Agent 创建 API Key。
-
-```powershell
-Copy-Item .env.example .env.local
-```
-
-编辑 `.env.local`：
-
-```dotenv
-ZGI_API_BASE_URL=http://localhost:2870/api/v1
-ZGI_AGENT_API_KEY=your-published-agent-api-key
-```
-
-然后启动：
+前提：本地 ZGI 网关已经运行，并且你已经为一个已发布 Agent 创建 API Key。无需创建 `.env` 文件，直接启动：
 
 ```bash
 pnpm install
 pnpm dev
 ```
 
-打开 [http://localhost:3000](http://localhost:3000)。如果 3000 已占用，Next.js 会提示实际端口。
+打开 [http://localhost:3000](http://localhost:3000)。如果 3000 已占用，Next.js 会提示实际端口。首次打开后在连接面板填写 Agent API Base URL（例如 `http://localhost:2870/api/v1`）和已发布 Agent 的 API Key。
 
-## 安全结构
+Base URL 保存在 localStorage；API Key 只保存在当前标签页的 sessionStorage，刷新页面仍可使用，关闭标签页后清除。切换 Base URL 或 Key 时，demo 会终止现有事件流并重新加载 Agent 配置和会话。
 
-浏览器不会直接请求 ZGI，也不会拿到 `ZGI_AGENT_API_KEY`。所有请求先进入 [`src/app/api/zgi/[...path]/route.ts`](src/app/api/zgi/%5B...path%5D/route.ts)，由该服务端路由：
+## 浏览器直连与安全边界
 
-1. 校验目标路径白名单；
-2. 从服务端环境变量读取 API Key；
-3. 把 demo 用户标识转换为 `X-External-User-ID`；
-4. 将 JSON、multipart 或 SSE 响应透明转发给浏览器。
+这个仓库有意采用浏览器直连，以便只修改页面配置就能验证不同环境和 Agent。每个请求都由前端添加 `Authorization: Bearer <API Key>` 和 `X-External-User-ID`。因此 ZGI 网关必须允许 demo 页面来源的 CORS，并允许 `Authorization`、`X-External-User-ID`、`Content-Type` 请求头。
 
-页面右上角可切换外部用户，方便本地验证数据隔离。这里的用户标识由浏览器传给代理，仅适合演示。生产环境必须从你自己的已认证服务端会话推导稳定、不可识别个人身份的标识，并在代理层校验 Agent 访问权限、限流和请求大小；不要信任浏览器提交的用户 id，也不要使用邮箱或手机号。
+本地 Docker 环境可把 demo 的精确来源加入 `WEB_API_CORS_ALLOW_ORIGINS`，例如 `http://localhost:3000`，然后重建或重启 API 容器。若 Next.js 自动使用了其他端口，也必须加入那个实际来源；不要在生产环境使用宽泛的通配来源。
+
+这种结构不适合生产环境：页面 JavaScript、浏览器扩展和开发者工具都可能访问 API Key。正式接入应把 Key 放在自己的服务端代理中，由已认证会话推导稳定、不可识别个人身份的外部用户标识，并在代理层校验 Agent 权限、限流和请求大小。不要信任浏览器提交的用户 id，也不要使用邮箱或手机号。
 
 ## 代码导航
 
@@ -55,8 +41,8 @@ pnpm dev
 - [`src/components/memory-panel.tsx`](src/components/memory-panel.tsx)：Agent Memory 管理
 - [`src/lib/approval-state.ts`](src/lib/approval-state.ts)：统一实时事件与历史 metadata 的审批状态，并控制等待态按钮可用时机
 - [`src/lib/zgi-client.ts`](src/lib/zgi-client.ts)：JSON 请求封装和增量 SSE 解析器
+- [`src/lib/agent-event-catalog.ts`](src/lib/agent-event-catalog.ts)：公开事件目录、中文解释和客户端处理建议
 - [`src/lib/agent-api-types.ts`](src/lib/agent-api-types.ts)：公开响应与事件的前端类型
-- [`src/app/api/zgi/[...path]/route.ts`](src/app/api/zgi/%5B...path%5D/route.ts)：保护 API Key 的服务端代理
 
 ## SSE 接入要点
 
@@ -69,6 +55,8 @@ data: {"event":"message","data":{"conversation_id":"...","message_id":"...","ans
 ```
 
 示例解析器支持数据跨网络 chunk、多个 `data:` 行、CRLF 和末尾未带空行的 frame。UI 以原生/JSON 事件名分派，以 `data` 内的 `conversation_id`、`message_id` 做关联，并把最近非空 `id` 持久化作为恢复游标。
+
+事件检查器保留当前会话最近 100 个事件，并区分聊天、重新生成、继续接口、状态回放和断线重连。每个事件都会显示对应的公开语义和建议处理方式；未识别的新事件会保留完整负载，但业务 UI 安全忽略。侧栏助手专属的客户端协同事件不属于 Agent API，也不在目录中。
 
 ## 工作流与恢复范例
 
@@ -87,4 +75,4 @@ pnpm lint
 pnpm build
 ```
 
-此项目是接入参考，不包含登录系统、持久化业务用户映射、生产级限流、审计或监控；上线前应在服务端代理层补齐这些能力。
+此项目是浏览器直连接入参考，不包含登录系统、持久化业务用户映射、生产级密钥保护、限流、审计或监控；上线前应在你自己的服务端代理层补齐这些能力。

@@ -1,42 +1,65 @@
 import type { ApiEnvelope, JsonObject, SseEvent } from "./agent-api-types";
 
-const DEMO_USER_HEADER = "X-Demo-User-ID";
+const EXTERNAL_USER_HEADER = "X-External-User-ID";
+
+export interface AgentApiConnection {
+  baseUrl: string;
+  apiKey: string;
+}
 
 export class AgentApiError extends Error {
+  public readonly status: number;
+  public readonly code?: string | number;
+
   constructor(
     message: string,
-    public readonly status: number,
-    public readonly code?: string,
+    status: number,
+    code?: string | number,
   ) {
     super(message);
     this.name = "AgentApiError";
+    this.status = status;
+    this.code = code;
   }
 }
 
 export async function zgiFetch(
+  connection: AgentApiConnection,
   path: string,
   externalUserId: string,
   init: RequestInit = {},
 ): Promise<Response> {
   const headers = new Headers(init.headers);
-  headers.set(DEMO_USER_HEADER, externalUserId);
+  headers.set("Authorization", `Bearer ${connection.apiKey}`);
+  headers.set(EXTERNAL_USER_HEADER, externalUserId);
   if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
 
-  return fetch(`/api/zgi/${path.replace(/^\/+/, "")}`, {
-    ...init,
-    headers,
-    cache: "no-store",
-  });
+  try {
+    return await fetch(`${normalizeAgentApiBaseUrl(connection.baseUrl)}/${path.replace(/^\/+/, "")}`, {
+      ...init,
+      headers,
+      cache: "no-store",
+    });
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new AgentApiError(
+        "浏览器无法连接 Agent API。请检查 Base URL、网关状态，以及 CORS 是否允许当前页面来源和 Authorization、X-External-User-ID、Content-Type 请求头。",
+        0,
+      );
+    }
+    throw error;
+  }
 }
 
 export async function zgiJson<T>(
+  connection: AgentApiConnection,
   path: string,
   externalUserId: string,
   init: RequestInit = {},
 ): Promise<T> {
-  const response = await zgiFetch(path, externalUserId, init);
+  const response = await zgiFetch(connection, path, externalUserId, init);
   const raw = await response.text();
   let parsed: unknown;
 
@@ -51,12 +74,12 @@ export async function zgiJson<T>(
     throw new AgentApiError(
       typeof error.message === "string" ? error.message : `请求失败（HTTP ${response.status}）`,
       response.status,
-      typeof error.code === "string" ? error.code : undefined,
+      typeof error.code === "string" || typeof error.code === "number" ? error.code : undefined,
     );
   }
 
   if (isEnvelope<T>(parsed)) {
-    if (parsed.code !== "0") {
+    if (String(parsed.code) !== "0") {
       throw new AgentApiError(parsed.message || "Agent API 返回失败", response.status, parsed.code);
     }
     return parsed.data;
@@ -143,6 +166,25 @@ export function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function normalizeAgentApiBaseUrl(value: string): string {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    throw new AgentApiError("Base URL 必须是完整的 http:// 或 https:// 地址", 0);
+  }
+  if (!['http:', 'https:'].includes(url.protocol)) {
+    throw new AgentApiError("Base URL 只支持 http:// 或 https://", 0);
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new AgentApiError("Base URL 不能包含账号、查询参数或锚点", 0);
+  }
+  return trimmed;
+}
+
 function isEnvelope<T>(value: unknown): value is ApiEnvelope<T> {
-  return isObject(value) && typeof value.code === "string" && "data" in value;
+  return isObject(value)
+    && (typeof value.code === "string" || typeof value.code === "number")
+    && "data" in value;
 }

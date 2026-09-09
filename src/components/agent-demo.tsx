@@ -15,6 +15,8 @@ import type {
   Conversation,
   ConversationList,
   ConversationMessage,
+  EventDeliverySource,
+  EventLogEntry,
   JsonObject,
   MessageList,
   PendingInteraction,
@@ -30,13 +32,19 @@ import {
   consumeSse,
   errorMessage,
   isObject,
+  normalizeAgentApiBaseUrl,
   zgiFetch,
   zgiJson,
 } from "@/lib/zgi-client";
+import type { AgentApiConnection } from "@/lib/zgi-client";
+import { getAgentEventDefinition, PUBLIC_AGENT_EVENT_NAMES } from "@/lib/agent-event-catalog";
 import { isPendingInteractionDisabled, normalizeApprovalState } from "@/lib/approval-state";
 import { MemoryPanel } from "./memory-panel";
 
 const DEFAULT_USER = "demo-user-001";
+const DEFAULT_API_BASE_URL = "http://localhost:2870/api/v1";
+const API_BASE_STORAGE_KEY = "zgi-demo-api-base-url";
+const API_KEY_SESSION_KEY = "zgi-demo-api-key";
 const MAX_RECONNECT_ATTEMPTS = 5;
 
 type ConnectionPhase = "idle" | "connecting" | "streaming" | "reconnecting" | "restoring" | "waiting" | "failed";
@@ -48,9 +56,14 @@ interface StreamOptions {
   replayFromStart?: boolean;
   reconnect?: boolean;
   clearPendingOnStart?: boolean;
+  source?: Exclude<EventDeliverySource, "reconnect">;
 }
 
 export function AgentDemo() {
+  const [apiConnection, setApiConnection] = useState<AgentApiConnection | null>(null);
+  const [apiBaseDraft, setApiBaseDraft] = useState(DEFAULT_API_BASE_URL);
+  const [apiKeyDraft, setApiKeyDraft] = useState("");
+  const [showConnectionSetup, setShowConnectionSetup] = useState(true);
   const [activeUser, setActiveUser] = useState(DEFAULT_USER);
   const [userDraft, setUserDraft] = useState(DEFAULT_USER);
   const [config, setConfig] = useState<AgentConfig | null>(null);
@@ -66,7 +79,7 @@ export function AgentDemo() {
   const [continuing, setContinuing] = useState(false);
   const [progress, setProgress] = useState("");
   const [pending, setPending] = useState<PendingInteraction | null>(null);
-  const [eventLog, setEventLog] = useState<SseEvent[]>([]);
+  const [eventLog, setEventLog] = useState<EventLogEntry[]>([]);
   const [showEvents, setShowEvents] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<"sessions" | "memory" | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -74,6 +87,11 @@ export function AgentDemo() {
   const [connection, setConnection] = useState<{ phase: ConnectionPhase; attempt: number }>({ phase: "idle", attempt: 0 });
   const streamController = useRef<AbortController | null>(null);
   const messagesEnd = useRef<HTMLDivElement | null>(null);
+
+  function requireApiConnection() {
+    if (!apiConnection) throw new AgentApiError("请先配置 Agent API Base URL 和 API Key", 0);
+    return apiConnection;
+  }
 
   const currentConversation = useMemo(
     () => conversations.find((item) => item.id === currentConversationId) ?? null,
@@ -85,25 +103,45 @@ export function AgentDemo() {
 
   useEffect(() => {
     const storedUser = window.localStorage.getItem("zgi-demo-user");
-    if (!storedUser || storedUser === DEFAULT_USER) return;
+    const storedBaseUrl = window.localStorage.getItem(API_BASE_STORAGE_KEY) || DEFAULT_API_BASE_URL;
+    const sessionApiKey = window.sessionStorage.getItem(API_KEY_SESSION_KEY) || "";
     const timer = window.setTimeout(() => {
-      setActiveUser(storedUser);
-      setUserDraft(storedUser);
+      if (storedUser && storedUser !== DEFAULT_USER) {
+        setActiveUser(storedUser);
+        setUserDraft(storedUser);
+      }
+      setApiBaseDraft(storedBaseUrl);
+      setApiKeyDraft(sessionApiKey);
+      if (sessionApiKey) {
+        try {
+          setApiConnection({ baseUrl: normalizeAgentApiBaseUrl(storedBaseUrl), apiKey: sessionApiKey });
+          setShowConnectionSetup(false);
+        } catch {
+          setShowConnectionSetup(true);
+        }
+      }
     }, 0);
     return () => window.clearTimeout(timer);
   }, []);
 
   const loadConversations = useCallback(
     async (needle = search) => {
+      if (!apiConnection) {
+        setConversations([]);
+        setSearchResults([]);
+        return;
+      }
       try {
         if (needle.trim()) {
           const results = await zgiJson<SearchResult[]>(
+            apiConnection,
             `agents/conversations/search?query=${encodeURIComponent(needle.trim())}&limit=30`,
             activeUser,
           );
           setSearchResults(results);
         } else {
           const result = await zgiJson<ConversationList>(
+            apiConnection,
             "agents/conversations?page=1&limit=50",
             activeUser,
           );
@@ -114,17 +152,19 @@ export function AgentDemo() {
         setFatalError(errorMessage(error));
       }
     },
-    [activeUser, search],
+    [activeUser, apiConnection, search],
   );
 
   useEffect(() => {
+    if (!apiConnection) return;
+    const currentApiConnection = apiConnection;
     let cancelled = false;
     async function bootstrap() {
       setFatalError(null);
       try {
         const [nextConfig, list] = await Promise.all([
-          zgiJson<AgentConfig>("agents/config", activeUser),
-          zgiJson<ConversationList>("agents/conversations?page=1&limit=50", activeUser),
+          zgiJson<AgentConfig>(currentApiConnection, "agents/config", activeUser),
+          zgiJson<ConversationList>(currentApiConnection, "agents/conversations?page=1&limit=50", activeUser),
         ]);
         if (cancelled) return;
         setConfig(nextConfig);
@@ -141,11 +181,54 @@ export function AgentDemo() {
     return () => {
       cancelled = true;
     };
-  }, [activeUser]);
+  }, [activeUser, apiConnection]);
 
   useEffect(() => {
     messagesEnd.current?.scrollIntoView({ behavior: streaming ? "instant" : "smooth" });
   }, [messages, pending, streaming]);
+
+  function resetWorkspaceState() {
+    streamController.current?.abort();
+    setConfig(null);
+    setConversations([]);
+    setSearchResults([]);
+    setCurrentConversationId(null);
+    setMessages([]);
+    setUploads([]);
+    setPending(null);
+    setEventLog([]);
+    setProgress("");
+    setFatalError(null);
+    setConnection({ phase: "idle", attempt: 0 });
+  }
+
+  function applyApiSettings(event?: FormEvent) {
+    event?.preventDefault();
+    try {
+      const baseUrl = normalizeAgentApiBaseUrl(apiBaseDraft);
+      const apiKey = apiKeyDraft.trim();
+      if (!apiKey) throw new AgentApiError("API Key 不能为空", 0);
+      window.localStorage.setItem(API_BASE_STORAGE_KEY, baseUrl);
+      window.sessionStorage.setItem(API_KEY_SESSION_KEY, apiKey);
+      resetWorkspaceState();
+      setApiBaseDraft(baseUrl);
+      setApiConnection({ baseUrl, apiKey });
+      setShowConnectionSetup(false);
+      setConnection({ phase: "connecting", attempt: 0 });
+      setNotice("连接配置已应用");
+    } catch (error) {
+      setFatalError(errorMessage(error));
+    }
+  }
+
+  function clearApiSettings() {
+    window.sessionStorage.removeItem(API_KEY_SESSION_KEY);
+    resetWorkspaceState();
+    setApiKeyDraft("");
+    setApiConnection(null);
+    setShowConnectionSetup(true);
+    setNotice("当前标签页的 API Key 已清除");
+  }
 
   function applyUser() {
     const normalized = userDraft.trim();
@@ -180,8 +263,9 @@ export function AgentDemo() {
     setMobilePanel(null);
     try {
       const [detail, result] = await Promise.all([
-        zgiJson<Conversation>(`agents/conversations/${encodeURIComponent(id)}`, activeUser),
+        zgiJson<Conversation>(requireApiConnection(), `agents/conversations/${encodeURIComponent(id)}`, activeUser),
         zgiJson<MessageList>(
+          requireApiConnection(),
           `agents/conversations/${encodeURIComponent(id)}/messages?page=1&limit=200`,
           activeUser,
         ),
@@ -202,6 +286,7 @@ export function AgentDemo() {
         const controller = new AbortController();
         streamController.current = controller;
         const response = await zgiFetch(
+          requireApiConnection(),
           `agents/conversations/${encodeURIComponent(id)}/events?message_id=${encodeURIComponent(recoveryMessageId)}`,
           activeUser,
           { signal: controller.signal },
@@ -211,6 +296,7 @@ export function AgentDemo() {
           messageId: recoveryMessageId,
           replayFromStart: true,
           reconnect: detail.runtime_status === "running",
+          source: "replay",
         });
       }
     } catch (error) {
@@ -272,7 +358,7 @@ export function AgentDemo() {
     setProgress(replaying ? "正在恢复消息状态…" : "正在连接 Agent…");
     setFatalError(null);
     try {
-      await consumeSseWithReconnect(response, (event) => {
+      await consumeSseWithReconnect(response, (event, delivery) => {
         const eventConversationId = asString(event.data.conversation_id, conversationId);
         const eventMessageId = asString(event.data.message_id, messageId);
         if (eventConversationId) {
@@ -286,7 +372,11 @@ export function AgentDemo() {
         if (event.id && messageId) {
           window.localStorage.setItem(cursorKey(activeUser, messageId), event.id);
         }
-        setEventLog((current) => [...current.slice(-39), event]);
+        setEventLog((current) => [...current.slice(-99), {
+          ...event,
+          receivedAt: Date.now(),
+          source: delivery === "reconnect" ? "reconnect" : options.source || (replaying ? "replay" : "chat"),
+        }]);
         setConnection({ phase: "streaming", attempt: 0 });
 
         if (event.event === "message_start") {
@@ -402,7 +492,11 @@ export function AgentDemo() {
             setStreaming(false);
             activeController?.abort();
           }
+          return;
         }
+
+        const optionalProgress = eventProgressLabel(event.event, event.data);
+        if (optionalProgress) setProgress(optionalProgress);
       }, {
         reconnect: options.reconnect ?? true,
         signal: activeController?.signal,
@@ -411,6 +505,7 @@ export function AgentDemo() {
           const params = new URLSearchParams({ message_id: messageId });
           if (afterId) params.set("after_id", afterId);
           return zgiFetch(
+            requireApiConnection(),
             `agents/conversations/${encodeURIComponent(conversationId)}/events?${params}`,
             activeUser,
             { signal: activeController?.signal },
@@ -465,13 +560,13 @@ export function AgentDemo() {
     const controller = new AbortController();
     streamController.current = controller;
     try {
-      const response = await zgiFetch("agents/chat", activeUser, {
+      const response = await zgiFetch(requireApiConnection(), "agents/chat", activeUser, {
         method: "POST",
         body: JSON.stringify(body),
         signal: controller.signal,
       });
       setUploads([]);
-      await runEventStream(response, { optimisticMessageId, reconnect: true });
+      await runEventStream(response, { optimisticMessageId, reconnect: true, source: "chat" });
     } catch (error) {
       setStreaming(false);
       setFatalError(errorMessage(error));
@@ -481,7 +576,7 @@ export function AgentDemo() {
   async function stopStream() {
     if (!currentConversationId) return;
     try {
-      await zgiJson(`agents/conversations/${encodeURIComponent(currentConversationId)}/stop`, activeUser, {
+      await zgiJson(requireApiConnection(), `agents/conversations/${encodeURIComponent(currentConversationId)}/stop`, activeUser, {
         method: "POST",
       });
       setProgress("停止请求已发送…");
@@ -502,6 +597,7 @@ export function AgentDemo() {
       const controller = new AbortController();
       streamController.current = controller;
       const response = await zgiFetch(
+        requireApiConnection(),
         `agents/conversations/${encodeURIComponent(currentConversation.id)}/events?${params}`,
         activeUser,
         { signal: controller.signal },
@@ -511,6 +607,7 @@ export function AgentDemo() {
         messageId,
         replayFromStart: true,
         reconnect: !!currentConversation.active_message_id,
+        source: "replay",
       });
     } catch (error) {
       setFatalError(errorMessage(error));
@@ -529,11 +626,12 @@ export function AgentDemo() {
       const controller = new AbortController();
       streamController.current = controller;
       const response = await zgiFetch(
+        requireApiConnection(),
         `agents/messages/${encodeURIComponent(lastAssistant.id)}/regenerate`,
         activeUser,
         { method: "POST", body: "{}", signal: controller.signal },
       );
-      await runEventStream(response, { optimisticMessageId: optimisticId, reconnect: true });
+      await runEventStream(response, { optimisticMessageId: optimisticId, reconnect: true, source: "regenerate" });
     } catch (error) {
       setFatalError(errorMessage(error));
       setStreaming(false);
@@ -549,7 +647,7 @@ export function AgentDemo() {
       for (const file of Array.from(files)) {
         const form = new FormData();
         form.append("file", file);
-        next.push(await zgiJson<UploadedFile>("files/upload", activeUser, { method: "POST", body: form }));
+        next.push(await zgiJson<UploadedFile>(requireApiConnection(), "files/upload", activeUser, { method: "POST", body: form }));
       }
       setUploads((current) => [...current, ...next]);
     } catch (error) {
@@ -569,7 +667,7 @@ export function AgentDemo() {
     try {
       const controller = new AbortController();
       streamController.current = controller;
-      const response = await zgiFetch(path, activeUser, {
+      const response = await zgiFetch(requireApiConnection(), path, activeUser, {
         method: "POST",
         body: JSON.stringify(body),
         signal: controller.signal,
@@ -579,6 +677,7 @@ export function AgentDemo() {
         messageId: interaction.messageId,
         reconnect: true,
         clearPendingOnStart: true,
+        source: "continuation",
       });
     } catch (error) {
       setPending(interaction);
@@ -594,6 +693,7 @@ export function AgentDemo() {
     if (title === undefined || !title) return;
     try {
       const updated = await zgiJson<Conversation>(
+        requireApiConnection(),
         `agents/conversations/${encodeURIComponent(item.id)}`,
         activeUser,
         { method: "PATCH", body: JSON.stringify({ title }) },
@@ -609,7 +709,7 @@ export function AgentDemo() {
   async function deleteConversation(item: Conversation) {
     if (!window.confirm(`确定删除“${item.title}”吗？`)) return;
     try {
-      await zgiJson(`agents/conversations/${encodeURIComponent(item.id)}`, activeUser, { method: "DELETE" });
+      await zgiJson(requireApiConnection(), `agents/conversations/${encodeURIComponent(item.id)}`, activeUser, { method: "DELETE" });
       if (item.id === currentConversationId) newConversation();
       await loadConversations("");
     } catch (error) {
@@ -647,6 +747,9 @@ export function AgentDemo() {
         </div>
         <div className="top-actions">
           <button className="mobile-button" onClick={() => setMobilePanel("sessions")} aria-label="打开会话列表">会话</button>
+          <button className="connection-settings-button" onClick={() => setShowConnectionSetup(true)}>
+            <span aria-hidden="true">⚙</span><b>连接设置</b>
+          </button>
           <label className="user-switcher">
             <span>外部用户</span>
             <input
@@ -658,8 +761,8 @@ export function AgentDemo() {
             />
             <button onClick={applyUser}>应用</button>
           </label>
-          <span className={`status-pill ${fatalError ? "is-error" : ""}`}>
-            <i /> {fatalError ? "需要配置" : "API 已连接"}
+          <span className={`status-pill ${fatalError || !apiConnection ? "is-error" : ""}`}>
+            <i /> {!apiConnection ? "API 未配置" : fatalError ? "连接异常" : "API 已连接"}
           </span>
           <button className="mobile-button" onClick={() => setMobilePanel("memory")} aria-label="打开记忆面板">记忆</button>
         </div>
@@ -733,7 +836,7 @@ export function AgentDemo() {
 
           <div className="message-scroll">
             {!messages.length ? (
-              <Welcome config={config} title={title} onPrompt={(prompt) => void sendMessage(undefined, prompt)} />
+              <Welcome config={config} title={title} configured={!!apiConnection} onPrompt={(prompt) => void sendMessage(undefined, prompt)} />
             ) : (
               <div className="messages">
                 {messages.map((message) => <MessageBubble key={`${message.role}-${message.id}`} message={message} />)}
@@ -773,18 +876,18 @@ export function AgentDemo() {
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
                 onKeyDown={onComposerKeyDown}
-                placeholder={config?.input_placeholder || "输入消息，Enter 发送，Shift + Enter 换行"}
+                placeholder={!apiConnection ? "请先在页面顶部配置 Agent API" : config?.input_placeholder || "输入消息，Enter 发送，Shift + Enter 换行"}
                 rows={1}
-                disabled={streaming}
+                disabled={streaming || !apiConnection}
               />
               {streaming ? (
                 <button type="button" className="stop-button" onClick={() => void stopStream()} title="停止生成"><span /></button>
               ) : (
-                <button type="submit" className="send-button" disabled={!query.trim()} title="发送">↑</button>
+                <button type="submit" className="send-button" disabled={!query.trim() || !apiConnection} title="发送">↑</button>
               )}
             </form>
             <div className="composer-footer">
-              <span>API Key 仅保存在 Next.js 服务端</span>
+              <span>本地演示：API Key 在当前标签页中直接使用</span>
               {!!messages.length && !streaming && <button onClick={() => void regenerate()}>↻ 重新生成上一条</button>}
             </div>
           </div>
@@ -795,15 +898,27 @@ export function AgentDemo() {
             <div><span className="eyebrow">User context</span><h2>Agent Memory</h2></div>
             <button className="icon-button mobile-close" onClick={() => setMobilePanel(null)}>×</button>
           </div>
-          <MemoryPanel activeUser={activeUser} enabled={config?.agent_memory_enabled ?? false} onError={setFatalError} />
+          <MemoryPanel connection={apiConnection} activeUser={activeUser} enabled={config?.agent_memory_enabled ?? false} onError={setFatalError} />
         </aside>
       </div>
       {mobilePanel && <button className="scrim" aria-label="关闭面板" onClick={() => setMobilePanel(null)} />}
+      {showConnectionSetup && (
+        <ConnectionSetup
+          baseUrl={apiBaseDraft}
+          apiKey={apiKeyDraft}
+          configured={!!apiConnection}
+          onBaseUrlChange={setApiBaseDraft}
+          onApiKeyChange={setApiKeyDraft}
+          onApply={applyApiSettings}
+          onClear={clearApiSettings}
+          onClose={() => setShowConnectionSetup(false)}
+        />
+      )}
     </main>
   );
 }
 
-function Welcome({ config, title, onPrompt }: { config: AgentConfig | null; title: string; onPrompt: (value: string) => void }) {
+function Welcome({ config, title, configured, onPrompt }: { config: AgentConfig | null; title: string; configured: boolean; onPrompt: (value: string) => void }) {
   return (
     <div className="welcome">
       <div className="agent-avatar">
@@ -813,7 +928,10 @@ function Welcome({ config, title, onPrompt }: { config: AgentConfig | null; titl
       </div>
       <span className="eyebrow">Start a conversation</span>
       <h2>{title}</h2>
-      <p>{config?.opening_statement || config?.description || "这是一个覆盖完整 Agent API 接入链路的参考实现。"}</p>
+      <p>{configured
+        ? config?.opening_statement || config?.description || "这是一个覆盖完整 Agent API 接入链路的参考实现。"
+        : "在页面顶部打开“连接设置”，填写 Agent API Base URL 和已发布 Agent 的 API Key。"}
+      </p>
       {!!config?.suggested_questions?.length && (
         <div className="suggestions">
           {config.suggested_questions.map((prompt) => <button key={prompt} onClick={() => onPrompt(prompt)}>{prompt}<span>↗</span></button>)}
@@ -1059,19 +1177,137 @@ function formatApprovalExpiry(value: string | number): string {
   }).format(timestamp);
 }
 
-function EventDrawer({ events, onClose }: { events: SseEvent[]; onClose: () => void }) {
+function ConnectionSetup({
+  baseUrl,
+  apiKey,
+  configured,
+  onBaseUrlChange,
+  onApiKeyChange,
+  onApply,
+  onClear,
+  onClose,
+}: {
+  baseUrl: string;
+  apiKey: string;
+  configured: boolean;
+  onBaseUrlChange: (value: string) => void;
+  onApiKeyChange: (value: string) => void;
+  onApply: (event: FormEvent) => void;
+  onClear: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="connection-overlay" role="presentation">
+      <section className="connection-dialog" role="dialog" aria-modal="true" aria-labelledby="connection-title">
+        <header>
+          <div><span className="eyebrow">Browser configuration</span><h2 id="connection-title">连接 Agent API</h2></div>
+          {configured && <button className="dialog-close" onClick={onClose} aria-label="关闭连接设置">×</button>}
+        </header>
+        <p>这个接入 demo 由浏览器直接请求 ZGI。Base URL 会保存在本机，API Key 只保存在当前标签页的 sessionStorage。</p>
+        <form onSubmit={onApply}>
+          <label>
+            <span>Agent API Base URL</span>
+            <input
+              type="url"
+              value={baseUrl}
+              onChange={(event) => onBaseUrlChange(event.target.value)}
+              placeholder={DEFAULT_API_BASE_URL}
+              autoComplete="url"
+              required
+            />
+            <small>需包含 <code>/api/v1</code>，例如 {DEFAULT_API_BASE_URL}</small>
+          </label>
+          <label>
+            <span>已发布 Agent 的 API Key</span>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={(event) => onApiKeyChange(event.target.value)}
+              placeholder="zgi_…"
+              autoComplete="off"
+              spellCheck={false}
+              required
+            />
+            <small>不会写入仓库或 localStorage；请求时作为 Bearer Token 直接发送。</small>
+          </label>
+          <div className="connection-warning">
+            <strong>仅用于本地接入演示</strong>
+            <span>浏览器代码和开发者工具可以访问 API Key。生产环境请改用你自己的服务端代理，并确保 ZGI 的 CORS 允许当前页面来源和所需请求头。</span>
+          </div>
+          <footer>
+            {configured && <button type="button" className="clear-connection" onClick={onClear}>清除当前 Key</button>}
+            <button type="submit" className="primary-button">保存并连接</button>
+          </footer>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+function EventDrawer({ events, onClose }: { events: EventLogEntry[]; onClose: () => void }) {
+  const [category, setCategory] = useState("all");
+  const [needle, setNeedle] = useState("");
+  const categories = [...new Set(events.map((event) => getAgentEventDefinition(event.event).category))];
+  const normalizedNeedle = needle.trim().toLowerCase();
+  const filtered = events.filter((event) => {
+    const definition = getAgentEventDefinition(event.event);
+    if (category !== "all" && definition.category !== category) return false;
+    if (!normalizedNeedle) return true;
+    return event.event.toLowerCase().includes(normalizedNeedle)
+      || definition.title.toLowerCase().includes(normalizedNeedle)
+      || JSON.stringify(event.data).toLowerCase().includes(normalizedNeedle);
+  });
+
   return (
     <aside className="event-drawer">
-      <header><div><span className="eyebrow">Developer view</span><h3>SSE 事件</h3></div><button onClick={onClose}>×</button></header>
-      <p>保留最近 40 个事件。每个非空 <code>id</code> 都会作为恢复游标保存。</p>
+      <header><div><span className="eyebrow">Developer view</span><h3>SSE 事件检查器</h3></div><button onClick={onClose} aria-label="关闭事件检查器">×</button></header>
+      <p>覆盖 {PUBLIC_AGENT_EVENT_NAMES.length} 个公开事件；保留当前会话最近 100 个事件。非空 SSE <code>id</code> 会作为恢复游标保存。</p>
+      <input className="event-search" value={needle} onChange={(event) => setNeedle(event.target.value)} placeholder="搜索事件名、字段或值" />
+      <div className="event-filters">
+        <button className={category === "all" ? "is-active" : ""} onClick={() => setCategory("all")}>全部 {events.length}</button>
+        {categories.map((value) => {
+          const definition = getAgentEventDefinition(events.find((event) => getAgentEventDefinition(event.event).category === value)?.event || "");
+          const count = events.filter((event) => getAgentEventDefinition(event.event).category === value).length;
+          return <button className={category === value ? "is-active" : ""} key={value} onClick={() => setCategory(value)}>{definition.categoryLabel} {count}</button>;
+        })}
+      </div>
       <div className="event-list">
-        {[...events].reverse().map((event, index) => (
-          <details key={`${event.id || "event"}-${index}`}>
-            <summary><span>{event.event}</span><code>{event.id || "non-recoverable"}</code></summary>
-            <pre>{JSON.stringify(event.data, null, 2)}</pre>
-          </details>
-        ))}
+        {[...filtered].reverse().map((event, index) => {
+          const definition = getAgentEventDefinition(event.event);
+          const identities = [
+            ["conversation", asString(event.data.conversation_id)],
+            ["message", asString(event.data.message_id)],
+            ["workflow", asString(event.data.workflow_run_id)],
+            ["node", asString(event.data.node_id)],
+            ["invocation", asString(event.data.invocation_id)],
+          ].filter((item) => item[1]);
+          return (
+            <details key={`${event.id || event.receivedAt}-${event.event}-${index}`} className={`event-card is-${definition.category}`}>
+              <summary>
+                <span className="event-summary-main"><i /><span><strong>{event.event}</strong><small>{definition.title}</small></span></span>
+                <time>{formatEventTime(event.receivedAt)}</time>
+              </summary>
+              <div className="event-detail">
+                <div className="event-badges">
+                  <span>{definition.categoryLabel}</span>
+                  <span>{eventSourceLabel(event.source)}</span>
+                  <span>{event.id ? "可恢复" : "无游标"}</span>
+                </div>
+                <p>{definition.description}</p>
+                <p><strong>客户端处理：</strong>{definition.clientAction}</p>
+                <dl>
+                  <div><dt>SSE ID</dt><dd><code>{event.id || "—"}</code></dd></div>
+                  {identities.map(([label, value]) => <div key={label}><dt>{label}</dt><dd><code>{value}</code></dd></div>)}
+                  {!!definition.keyFields.length && <div><dt>关键字段</dt><dd>{definition.keyFields.join(" · ")}</dd></div>}
+                </dl>
+                <div className="event-json-label">完整 data 负载</div>
+                <pre>{JSON.stringify(event.data, null, 2)}</pre>
+              </div>
+            </details>
+          );
+        })}
         {!events.length && <p className="empty-copy">发送消息后可在这里检查事件负载。</p>}
+        {!!events.length && !filtered.length && <p className="empty-copy">没有符合当前筛选条件的事件。</p>}
       </div>
     </aside>
   );
@@ -1087,13 +1323,14 @@ interface ReconnectOptions {
 
 async function consumeSseWithReconnect(
   initialResponse: Response,
-  onEvent: (event: SseEvent) => void,
+  onEvent: (event: SseEvent, delivery: "initial" | "reconnect") => void,
   options: ReconnectOptions,
 ): Promise<void> {
   let response = initialResponse;
   let lastEventId = "";
   let attempt = 0;
   let terminal = false;
+  let delivery: "initial" | "reconnect" = "initial";
   const seenEventIds = new Set<string>();
 
   while (true) {
@@ -1106,7 +1343,7 @@ async function consumeSseWithReconnect(
           lastEventId = event.id;
         }
         if (event.event === "message_end" || event.event === "error") terminal = true;
-        onEvent(event);
+        onEvent(event, delivery);
       });
     } catch (error) {
       streamError = error;
@@ -1127,7 +1364,10 @@ async function consumeSseWithReconnect(
     options.onReconnect(attempt, delay);
     await abortableDelay(delay, options.signal);
     response = await options.recover(lastEventId);
-    if (response.ok) options.onRecovered();
+    if (response.ok) {
+      delivery = "reconnect";
+      options.onRecovered();
+    }
   }
 }
 
@@ -1409,6 +1649,39 @@ function progressLabel(data: JsonObject): string {
     preparing_action: "正在准备下一步操作…",
   };
   return labels[activity] || "Agent 正在处理…";
+}
+
+function eventProgressLabel(event: string, data: JsonObject): string {
+  const definition = getAgentEventDefinition(event);
+  if (event === "agent_intermediate_answer") return asString(data.title, "Agent 正在整理阶段性答案…");
+  if (event === "file_parse_start") return `正在解析文件 ${asString(data.name, "")}`.trim() + "…";
+  if (event === "file_parse_end") return "文件解析完成，正在继续处理…";
+  if (event === "file_parse_error") return `文件解析失败：${asString(data.message, asString(data.name, "未知文件"))}`;
+  if (event === "skill_artifact_created") return `已生成文件 ${asString(data.filename, "")}`.trim();
+  if (event.endsWith("_start") || event.endsWith("_started") || event.endsWith("_next")) return `${definition.title}…`;
+  if (event.endsWith("_error") || event.endsWith("_failed")) return definition.title;
+  return "";
+}
+
+function eventSourceLabel(source: EventDeliverySource): string {
+  const labels: Record<EventDeliverySource, string> = {
+    chat: "聊天接口",
+    regenerate: "重新生成",
+    continuation: "继续接口",
+    replay: "状态回放",
+    reconnect: "断线重连",
+  };
+  return labels[source];
+}
+
+function formatEventTime(timestamp: number): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    fractionalSecondDigits: 3,
+    hour12: false,
+  }).format(timestamp);
 }
 
 function connectionLabel(connection: { phase: ConnectionPhase; attempt: number }): string {

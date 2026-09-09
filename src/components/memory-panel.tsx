@@ -2,28 +2,30 @@
 
 import { useCallback, useEffect, useState } from "react";
 import type { MemoryExport, MemorySlot } from "@/lib/agent-api-types";
+import type { AgentApiConnection } from "@/lib/zgi-client";
 import { errorMessage, zgiFetch, zgiJson } from "@/lib/zgi-client";
 
 interface MemoryPanelProps {
+  connection: AgentApiConnection | null;
   activeUser: string;
   enabled: boolean;
   onError: (message: string | null) => void;
 }
 
-export function MemoryPanel({ activeUser, enabled, onError }: MemoryPanelProps) {
+export function MemoryPanel({ connection, activeUser, enabled, onError }: MemoryPanelProps) {
   const [memory, setMemory] = useState<MemoryExport | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   const load = useCallback(async () => {
-    if (!enabled) {
+    if (!enabled || !connection) {
       setMemory(null);
       return;
     }
     setLoading(true);
     try {
-      const result = await zgiJson<MemoryExport>("agents/memory", activeUser);
+      const result = await zgiJson<MemoryExport>(connection, "agents/memory", activeUser);
       setMemory(result);
       setDrafts(Object.fromEntries(result.values.map((slot) => [slot.key, slot.content])));
     } catch (error) {
@@ -31,7 +33,7 @@ export function MemoryPanel({ activeUser, enabled, onError }: MemoryPanelProps) 
     } finally {
       setLoading(false);
     }
-  }, [activeUser, enabled, onError]);
+  }, [activeUser, connection, enabled, onError]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void load(), 0);
@@ -41,7 +43,8 @@ export function MemoryPanel({ activeUser, enabled, onError }: MemoryPanelProps) 
   async function save(slot: MemorySlot) {
     setBusyKey(slot.key);
     try {
-      await zgiJson<MemorySlot>(`agents/memory/${encodeURIComponent(slot.key)}`, activeUser, {
+      if (!connection) return;
+      await zgiJson<MemorySlot>(connection, `agents/memory/${encodeURIComponent(slot.key)}`, activeUser, {
         method: "PUT",
         body: JSON.stringify({ content: drafts[slot.key] || "", expected_revision: slot.revision }),
       });
@@ -56,7 +59,9 @@ export function MemoryPanel({ activeUser, enabled, onError }: MemoryPanelProps) 
   async function clearSlot(slot: MemorySlot) {
     setBusyKey(slot.key);
     try {
+      if (!connection) return;
       await zgiJson<MemorySlot>(
+        connection,
         `agents/memory/${encodeURIComponent(slot.key)}?expected_revision=${slot.revision}`,
         activeUser,
         { method: "DELETE" },
@@ -73,7 +78,9 @@ export function MemoryPanel({ activeUser, enabled, onError }: MemoryPanelProps) 
     if (!slot.last_operation_id) return;
     setBusyKey(slot.key);
     try {
+      if (!connection) return;
       await zgiJson(
+        connection,
         `agents/memory/operations/${encodeURIComponent(slot.last_operation_id)}/undo`,
         activeUser,
         { method: "POST" },
@@ -90,7 +97,8 @@ export function MemoryPanel({ activeUser, enabled, onError }: MemoryPanelProps) 
     if (!window.confirm("确定清空当前用户的所有可写 Agent Memory 吗？")) return;
     setBusyKey("*");
     try {
-      await zgiJson("agents/memory", activeUser, { method: "DELETE" });
+      if (!connection) return;
+      await zgiJson(connection, "agents/memory", activeUser, { method: "DELETE" });
       await load();
     } catch (error) {
       onError(errorMessage(error));
@@ -101,7 +109,8 @@ export function MemoryPanel({ activeUser, enabled, onError }: MemoryPanelProps) 
 
   async function downloadExport() {
     try {
-      const response = await zgiFetch("agents/memory/export", activeUser);
+      if (!connection) return;
+      const response = await zgiFetch(connection, "agents/memory/export", activeUser);
       if (!response.ok) throw new Error(`导出失败（HTTP ${response.status}）`);
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
